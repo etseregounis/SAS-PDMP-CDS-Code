@@ -1,0 +1,968 @@
+**************************************************************************************************************************************
+**************************************************************************************************************************************
+**										Code to Prepare Data File for Model Development 					 						**
+**															 **											 	 						**
+**				     				   		  Developed for CURES Data (7-2020) 							 						**
+**												  Adapted for KASPER Data						 			 						**
+**							          	   				  11-2024									 		 						**
+**************************************************************************************************************************************
+**************************************************************************************************************************************;;
+
+options compress = yes;
+
+
+libname poni "Y:\095IPOP_KASPER_Delcher-DataAnalytics\analytical_files";
+libname rp "Y:\095IPOP_KASPER_Delcher-DataAnalytics\analytical_files";
+
+
+***********************************************************************************************
+**								Table of Contents											 **
+***********************************************************************************************
+
+Section 1: Trajectory Variables 												(Lines 58-613)
+	- 1.1 Generate Base Dataset 												(Line 64)
+	- 1.2 Characterize Trajectories Using Local Dose Polynomials 				(Line 151)
+	- 1.3 Charactarize Trajectory Using Patient-level Residuals 				(Line 357)
+	- 1.4 Merge Trajectory Files												(Line 604)
+
+Section 2: Non-trajectory Variables												(Lines 621-737)
+	- 2.1 Generate Base Dataset 												(Line 626)
+	- 2.2 Active Prescription Variables											(Line 641)
+	- 2.3 Dose Summary Variables												(Line 720)
+ 
+Section 3: Merge Datasets Into Single Analysis File								(Lines 740-845)
+	- 3.1 Merge Individual Data Files											(Line 751)
+	- 3.2 Add Variable Transformations											(Line 799)
+	- 3.3 Final Files															(Line 823)
+
+***********************************************************************************************
+***********************************************************************************************
+
+NOTES:
+
+* Code generates pill opioid dose trajectories for PONIs with pill opioid 
+  prescription on their index day
+
+* See PONI file (PONI_code_KASPER.sas) for how files of all index rx to opioid naive 
+  (poni.first_opi) and all opioid rxs (poni.all_opioids) were generated
+
+* Variables created from prescription records within 30 days of index day
+
+* Trajectory variables developed using records for pill-form opioids only
+
+
+***********************************************************************************************
+***********************************************************************************************;
+
+
+***********************************************************************************************
+**										SECTION 1									  		 **
+**								   Trajectory Variables									  	 **
+***********************************************************************************************;
+
+
+***** 1.1 Generate Base Dataset *****
+
+** Isolate 30-day period post index opioid (one record per day post index per patient)
+* Generate datafile with all Rxs given to any PONIs that appear in KASPER within 30 days of index Rx;;
+* Dataset with all index days;;
+
+proc sql;
+create table rp.id_po as
+select distinct clust_num, year(filled_at) as year, max(filled_at) as filled_at format mmddyy10.,
+ 	count(filled_at) as nrxs, count(distinct tab) as nrxtypes
+from poni.first_opi where tab=1 and 2020 < calculated year < 2024
+group by clust_num, year;
+quit;
+* Merge in all opioid pill prescriptions from index day to day 30;;
+proc sql; create table p30_po (compress = yes) as
+select *, naiveday+29 as day30 format mmddyy10.
+from	(
+		select b.clust_num, b.year, a.filled_at, a.days_supply, a.quantity, a.quantity/a.days_supply as quan_day, 
+			   a.mme_eq, b.filled_at as naiveday
+		from poni.all_opioids (where=(opioid=1 and tab=1)) a
+		right join rp.id_po b on a.clust_num=b.clust_num and a.year=b.year
+		) 
+where filled_at ge naiveday and filled_at le (calculated day30);
+quit;
+
+** Create file with dose total for each day within 30 days post index date;;
+*  Expand each rx out to individual days following index date;; 
+data p30_po_days (compress = yes);					
+set p30_po; where days_supply ne .;
+do day=filled_at to (filled_at+days_supply-1);
+	format day mmddyy10.;
+	output;
+end;
+run;
+* Collapse data to one record per patient-day following index date - with calculations;;
+proc sql; create table p30_po_days2 (compress = yes) as
+select clust_num, firstday, day, max(daysafter) as d, sum(mme_eq) as mme, sum(quantity) as quan, sum(quan_day) as qday
+from	(
+		select clust_num, day, naiveday as firstday, day-naiveday as daysafter, mme_eq, quantity, quan_day
+		from p30_po_days where day le day30 and day ge naiveday
+		)
+group by clust_num, firstday, day;
+quit;
+
+** Impute zeros for days missing dose;;
+* clust_nums from file;;
+proc sql; create table pp as 					
+select distinct clust_num, firstday
+from p30_po_days2 group by clust_num, firstday;
+quit;
+* Generate "empty" days - days without opioid rx;;
+data pp;										
+set pp; by clust_num firstday;
+do days=0 to 29; output; end;
+run;
+* Merge empty days into collapsed data file and replace missing mme/quantity with zeros;;
+proc sql; create table rp.p30_po as			
+select clust_num, days, firstday, case when m = . then 0 else m end as mme, case when q = . then 0 else q end as quan, 
+	case when qd = . then 0 else qd end as quan_day
+from 	(
+		select b.clust_num, b.firstday, b.days as days, a.mme as m, a.quan as q, a.qday as qd
+		from p30_po_days2 a full join pp b on a.clust_num=b.clust_num and a.firstday=b.firstday and a.d=b.days
+		)
+order by clust_num, firstday, days;
+quit;
+
+** Prepare file for analysis;;
+* Id invididual PONI episodes;;
+proc sql;
+create table rp.p_eps as
+select *, monotonic() as epi_id
+from	(select distinct clust_num, naiveday as firstday, count(*) as n_rxs
+		 from p30_po group by clust_num, naiveday
+		);
+quit;
+* Prepare file for trajectory variable construction: center days -> generate second and third order day terms;;
+proc sql; create table rp.analysis_pill (compress=yes) as 
+select 	b.epi_id, a.clust_num, a.firstday, a.days-15 as dc, (a.days-15)*(a.days-15) as dc_2, (a.days-15)*(a.days-15)*(a.days-15) as dc_3, 
+		a.days as d, a.days*a.days as d_2, a.days*a.days*a.days as d_3,
+		a.mme, a.quan, a.quan_day
+from rp.p30_po a left join rp.p_eps b on a.clust_num=b.clust_num and a.firstday=b.firstday;
+quit;
+
+* Delete datasets no longer needed;
+proc datasets library=work; delete p30_po p30_po_days p30_po_days2 pp; run; quit;
+
+
+***** 1.2 Characterize Trajectories Using Local Dose Polynomials *****
+
+;
+** Fit polynomials for Daily MME and Quantity;
+proc sort data=rp.analysis_pill; by epi_id d; run;
+proc reg data=rp.analysis_pill plots=none outest=poly_m_pill;
+by epi_id; model mme = dc dc_2 dc_3 / noprint ;
+run;
+proc reg data=rp.analysis_pill plots=none outest=poly_q_pill;
+by epi_id; model quan_day = dc dc_2 dc_3 / noprint ;
+run;
+
+** Calculate MME summary statistics;;
+* Prep file for calculations;;
+proc sql;							
+create table pm as
+select epi_id, (3*dc_3) as a, (2*dc_2) as b, dc as c,
+	   dc_3 as b3, dc_2 as b2, dc as b1, intercept as b0
+from poly_m_pill;
+quit;
+* MME: Polynomial statistic calculations;;
+data calc_m; set pm;				
+aucall	=((-12209/4)*b3)+((6119/3)*b2)+((-14.5)*b1)+(29*b0); 	/* area under the curve (all 29 days) */
+auc_30	=(30*b0)+(2250*b2); 									/* area under the curve (all 30 days) */
+auc1	=(-12656.25*b3)+(1125*b2)+(-112.5*b1)+(15*b0); 			/* area under the curve (0 to 15 days) */ 
+auc2	=(9406*b3)+(2744*b2)+(98*b1)+(14*b0); 					/* area under the curve (15 to 29 days) */ 
+auc3	=(-12500*b3)+((3250/3)*b2)-(100*b1)+(10*b0); 			/* area under the curve (0 to 10 days) */
+auc4	=((250/3)*b2)+(10*b0); 									/* area under the curve (10 to 20 days) */
+auc5	=(9447.75*b3)+((2869/3)*b2)+(85.5*b1)+(9*b0); 			/* area under the curve (20 to 29 days) */
+auc2_30	=(12656.25*b3)+(1125*b2)+(112.5*b1)+(15*b0); 			/* area under the curve (15 to 30 days) */ 
+auc5_30	=(12500*b3)+((3250/3)*b2)+(100*b1)+(10*b0); 			/* area under the curve (20 to 30 days) */
+
+sq=(b*b)-(4*a*c);
+if a ne 0 and sq ge 0 then p=((-b)+sqrt(sq))/(2*a); 			/* local polynomial critical point - plus - if outside range set to missing */
+	if p gt 14 then p = .; if p lt -15 then p = .;
+if a ne 0 and sq ge 0 then m=((-b)-sqrt(sq))/(2*a); 			/* local polynomial critical point - minus - if outside range set to missing */
+	if m gt 14 then m = .; if m lt -15 then m = .;
+phat_0=((-15)*(-15)*(-15)*b3)+((-15)*(-15)*b2)+((-15)*b1)+b0; 	/* predicted daily mme at day zero */
+phat_30=((14)*(14)*(14)*b3)+((14)*(14)*b2)+((14)*b1)+b0; 		/* predicted daily mme at day thirty */
+if p ne . then phat_plus=(p*p*p*b3)+(p*p*b2)+(p*b1)+b0; 		/* predicted daily mme at plus critical point */
+if m ne . then phat_minus=(m*m*m*b3)+(m*m*b2)+(m*b1)+b0; 		/* predicted daily mme at minus critical point */
+mn=min(of phat_0, phat_30, phat_plus, phat_minus); 				/* select minimum predicted mme */
+	if mn=phat_0 then day_min=-15; 
+	if mn=phat_30 then day_min=14;
+	if mn=phat_plus then day_min=p; 
+	if mn=phat_minus then day_min=m; 							/* determine on which day the minimum occurs */
+mx=max(of phat_0, phat_30, phat_plus, phat_minus); 				/* select maximum predicted mme*/
+	if mx=phat_0 then day_max=-15; 
+	if mx=phat_30 then day_max=14;
+	if mx=phat_plus then day_max=p; 
+	if mx=phat_minus then day_max=m;							/* determine on which day the maximum occurs */
+
+if b3 ne 0 then v10=((-b2)/(3*b3))+5;							/* day of critical point - if outside range set to missing */
+	if v10 gt 14 then v10 = .; if v10 lt -6 then v10 = .;
+v10_sq=30*b3; v10_lin=(-300*b3)+(20*b2); 
+v10_cons=(1000*b3)-(100*b2)+(10*b1);
+v10_0to10=((-6)*(-6)*v10_sq)+((-6)*v10_lin)+v10_cons;			/* change between days 0 and 10 */
+v10_20to30=((14)*(14)*v10_sq)+((14)*v10_lin)+v10_cons;			/* change between days 20 and 30 */
+if v10 ne . 
+	then v10_crit=((v10)*(v10)*v10_sq)+((v10)*v10_lin)+v10_cons;/* change over 10 days prior to critical point */
+vmx10=max(of v10_crit, v10_0to10, v10_20to30);					/* select maximum predicted 10-day change */
+	if vmx10=v10_crit then day_v10max=v10;
+	if vmx10=v10_0to10 then day_v10max=-6;
+	if vmx10=v10_20to30 then day_v10max=14;						/* determine on which day the maximum change occurs */
+
+v5=(75-(10*b2))/30;												/* day of critical point - if outside range set to missing */
+	if v5 gt 14 then v5 = .; if v5 lt -11 then v5 = .;
+v5_sq=15; v5_lin=(10*b2)-75; v5_cons=(-25*b2)+(5*b1)+125;
+v5_0to5=((-11)*(-11)*(v5_sq))+((-11)*v5_lin)+v5_cons;			/* change between days 0 and 5 */
+v5_25to30=((14)*(14)*(v5_sq))+((14)*v5_lin)+v5_cons;			/* change between days 25 and 30 */
+if v5 ne . 
+	then v5_crit=((v5)*(v5)*(v5_sq))+((v5)*v5_lin)+v5_cons;		/* change over 5 days prior to critical point */
+vmx5=max(of v5_crit, v5_0to5, v5_25to30);						/* select maximum predicted 5-day change*/
+	if vmx5=v5_crit then day_v5max=v5;
+	if vmx5=v5_0to5 then day_v5max=-11;
+	if vmx5=v5_25to30 then day_v5max=14;						/* determine on which day the maximum change occurs */
+run;
+* MME: Categorize and construct additional variables;;
+proc sql; 							
+create table mmestats as	
+select 	epi_id, aucall as mme_auc, auc_30 as mme_aucold,
+		auc1 as mme_auc0to15, auc2 as mme_auc15to30, auc3 as mme_auc0to10, auc4 as mme_auc10to20, auc5 as mme_auc20to30,
+		auc2-auc1 as mme_diff_auc, auc4-auc3 as mme_diff_auc1, auc5-auc4 as mme_diff_auc2, 
+		day_min+15 as mme_minday, day_max+15 as mme_maxday,
+		case when day_max ge -15 and day_max lt -5 then 1
+			 when day_max ge -5 and day_max lt 5 then 2
+			 when day_max ge 5 and day_max le 14 then 3 else . end as mme_maxday_c,
+		case when day_min ge -15 and day_min lt -5 then 1
+			 when day_min ge -5 and day_min lt 5 then 2
+			 when day_min ge 5 and day_min le 14 then 3 else . end as mme_minday_c,
+		day_v5max+15 as mme_v5_maxday,
+		case when day_v5max ge -15 and day_v5max lt -5 then 1
+			 when day_v5max ge -5 and day_v5max lt 5 then 2
+			 when day_v5max ge 5 and day_v5max le 14 then 3 else . end as mme_v5_maxday_c,
+		day_v10max+15 as mme_v10_maxday,
+		case when day_v10max ge -15 and day_v10max lt -5 then 1
+			 when day_v10max ge -5 and day_v10max lt 5 then 2
+			 when day_v10max ge 5 and day_v10max le 14 then 3 else . end as mme_v10_maxday_c
+from calc_m;
+quit;
+
+** Calculate QUANTITY summary statistics;;
+* Prep file for calculations;;
+proc sql;						
+create table pq as
+select epi_id, (3*dc_3) as a, (2*dc_2) as b, dc as c,
+	   dc_3 as b3, dc_2 as b2, dc as b1, intercept as b0
+from poly_q_pill;
+quit;
+* QUAN: Polynomial statistic calculations;;
+data calc_q; set pq;				
+aucall	=((-12209/4)*b3)+((6119/3)*b2)+((-14.5)*b1)+(29*b0); 	/* area under the curve (all 29 days) */
+auc_30	=(30*b0)+(2250*b2); 									/* area under the curve (all 30 days) */
+auc1	=(-12656.25*b3)+(1125*b2)+(-112.5*b1)+(15*b0); 			/* area under the curve (0 to 15 days) */ 
+auc2	=(9406*b3)+(2744*b2)+(98*b1)+(14*b0); 					/* area under the curve (15 to 29 days) */ 
+auc3	=(-12500*b3)+((3250/3)*b2)-(100*b1)+(10*b0); 			/* area under the curve (0 to 10 days) */
+auc4	=((250/3)*b2)+(10*b0); 									/* area under the curve (10 to 20 days) */
+auc5	=(9447.75*b3)+((2869/3)*b2)+(85.5*b1)+(9*b0); 			/* area under the curve (20 to 29 days) */
+auc2_30	=(12656.25*b3)+(1125*b2)+(112.5*b1)+(15*b0); 			/* area under the curve (15 to 30 days) */ 
+auc5_30	=(12500*b3)+((3250/3)*b2)+(100*b1)+(10*b0); 			/* area under the curve (20 to 30 days) */
+
+sq=(b*b)-(4*a*c);
+if a ne 0 and sq ge 0 then p=((-b)+sqrt(sq))/(2*a); 			/* local polynomial critical point - plus - if outside range set to missing */
+	if p gt 14 then p = .; if p lt -15 then p = .;
+if a ne 0 and sq ge 0 then m=((-b)-sqrt(sq))/(2*a); 			/* local polynomial critical point - minus - if outside range set to missing */
+	if m gt 14 then m = .; if m lt -15 then m = .;
+phat_0=((-15)*(-15)*(-15)*b3)+((-15)*(-15)*b2)+((-15)*b1)+b0; 	/* predicted daily q at day zero */
+phat_30=((14)*(14)*(14)*b3)+((14)*(14)*b2)+((14)*b1)+b0; 		/* predicted daily q at day thirty */
+if p ne . then phat_plus=(p*p*p*b3)+(p*p*b2)+(p*b1)+b0; 		/* predicted daily q at plus critical point */
+if m ne . then phat_minus=(m*m*m*b3)+(m*m*b2)+(m*b1)+b0; 		/* predicted daily q at minus critical point */
+mn=min(of phat_0, phat_30, phat_plus, phat_minus); 				/* select minimum predicted mme */
+	if mn=phat_0 then day_min=-15; 
+	if mn=phat_30 then day_min=14;
+	if mn=phat_plus then day_min=p; 
+	if mn=phat_minus then day_min=m; 							/* determine on which day the minimum occurs */
+mx=max(of phat_0, phat_30, phat_plus, phat_minus); 				/* select maximum predicted q*/
+	if mx=phat_0 then day_max=-15; 
+	if mx=phat_30 then day_max=14;
+	if mx=phat_plus then day_max=p; 
+	if mx=phat_minus then day_max=m;							/* determine on which day the maximum occurs */
+
+if b3 ne 0 then v10=((-b2)/(3*b3))+5;							/* day of critical point - if outside range set to missing */
+	if v10 gt 14 then v10 = .; if v10 lt -6 then v10 = .;
+v10_sq=30*b3; v10_lin=(-300*b3)+(20*b2); 
+v10_cons=(1000*b3)-(100*b2)+(10*b1);
+v10_0to10=((-6)*(-6)*v10_sq)+((-6)*v10_lin)+v10_cons;			/* change between days 0 and 10 */
+v10_20to30=((14)*(14)*v10_sq)+((14)*v10_lin)+v10_cons;			/* change between days 20 and 30 */
+if v10 ne . 
+	then v10_crit=((v10)*(v10)*v10_sq)+((v10)*v10_lin)+v10_cons;/* change over 10 days prior to critical point */
+vmx10=max(of v10_crit, v10_0to10, v10_20to30);					/* select maximum predicted 10-day change */
+	if vmx10=v10_crit then day_v10max=v10;
+	if vmx10=v10_0to10 then day_v10max=-6;
+	if vmx10=v10_20to30 then day_v10max=14;						/* determine on which day the maximum change occurs */
+
+v5=(75-(10*b2))/30;												/* day of critical point - if outside range set to missing */
+	if v5 gt 14 then v5 = .; if v5 lt -11 then v5 = .;
+v5_sq=15; v5_lin=(10*b2)-75; v5_cons=(-25*b2)+(5*b1)+125;
+v5_0to5=((-11)*(-11)*(v5_sq))+((-11)*v5_lin)+v5_cons;			/* change between days 0 and 5 */
+v5_25to30=((14)*(14)*(v5_sq))+((14)*v5_lin)+v5_cons;			/* change between days 25 and 30 */
+if v5 ne . 
+	then v5_crit=((v5)*(v5)*(v5_sq))+((v5)*v5_lin)+v5_cons;		/* change over 5 days prior to critical point */
+vmx5=max(of v5_crit, v5_0to5, v5_25to30);						/* select maximum predicted 5-day change*/
+	if vmx5=v5_crit then day_v5max=v5;
+	if vmx5=v5_0to5 then day_v5max=-11;
+	if vmx5=v5_25to30 then day_v5max=14;						/* determine on which day the maximum change occurs */
+
+run;
+* QUAN: Categorize and construct additional variables;;
+proc sql; 							
+create table quanstats as	
+select 	epi_id, aucall as q_auc, auc_30 as q_aucold,
+		auc1 as q_auc0to15, auc2 as q_auc15to30, auc3 as q_auc0to10, auc4 as q_auc10to20, auc5 as q_auc20to30,
+		auc2-auc1 as q_diff_auc, auc4-auc3 as q_diff_auc1, auc5-auc4 as q_diff_auc2, 
+		day_min+15 as q_minday, day_max+15 as q_maxday,
+		case when day_max ge -15 and day_max lt -5 then 1
+			 when day_max ge -5 and day_max lt 5 then 2
+			 when day_max ge 5 and day_max le 14 then 3 else . end as q_maxday_c,
+		case when day_min ge -15 and day_min lt -5 then 1
+			 when day_min ge -5 and day_min lt 5 then 2
+			 when day_min ge 5 and day_min le 14 then 3 else . end as q_minday_c,
+		day_v5max+15 as q_v5_maxday,
+		case when day_v5max ge -15 and day_v5max lt -5 then 1
+			 when day_v5max ge -5 and day_v5max lt 5 then 2
+			 when day_v5max ge 5 and day_v5max le 14 then 3 else . end as q_v5_maxday_c,
+		day_v10max+15 as q_v10_maxday,
+		case when day_v10max ge -15 and day_v10max lt -5 then 1
+			 when day_v10max ge -5 and day_v10max lt 5 then 2
+			 when day_v10max ge 5 and day_v10max le 14 then 3 else . end as q_v10_maxday_c
+from calc_q;
+quit;
+
+** Merge MME and quantity files;
+proc sql;
+create table rp.pstats_po (compress=yes drop=eid) as
+select a.*, b.*
+from mmestats 							 a inner join 
+	 quanstats (rename=(epi_id=eid)) b on a.epi_id=b.eid
+;
+quit;
+
+* Delete datasets no longer needed;
+proc datasets library=work noprint; 
+delete poly_m_pill poly_q_pill pm p_mmme p_mmme2 calc_m mmestats pq p_quan p_quan2 calc_q quanstats; 
+run; quit;
+
+
+***** 1.3 Charactarize Trajectory Using Patient-level Residuals *****
+
+1. Generate smoothed fixed effects model for the entire dataset - may want to include year term as well
+2. Calculate predictive value for each day based on model fixed effect coefficients
+3. Subtract patient MMEs/Quantities on each day by the predicted value derived from smoothed model
+4. Fit GLM to residuals - use subject specific coefficients as trajectory covariates in RP Model
+;;
+
+** Generate dose residuals for each patient day post-index
+* Use PROC GAMPL to output residuals;;
+proc gampl data=rp.analysis_pill plots seed=6052020;
+model mme = spline(dc_3 / maxknots=3) spline(dc_2 / maxknots=3) spline(dc / maxknots=3) 
+	  / method=performance;
+output out=res_m_pill resid;
+id epi_id dc;
+run; quit;
+proc gampl data=rp.analysis_pill plots seed=6052020;
+model quan_day = spline(dc_3 / maxknots=3) spline(dc_2 / maxknots=3) spline(dc / maxknots=3) 
+	  / method=performance;
+output out=res_q_pill resid;
+id epi_id dc;
+run; quit;
+proc sql;
+create table rp.analysis_pill2 (compress=yes) as 
+select a.epi_id, a.dc, a.dc_2, a.dc_3, b.residual as res_m, c.residual as res_q
+from rp.analysis_pill a left join 
+	 res_m_pill b on a.epi_id=b.epi_id and a.dc=b.dc left join 
+	 res_q_pill c on a.epi_id=c.epi_id and a.dc=c.dc;
+quit;
+* Use PROC REG to fit cubic polynomials to patient residuals;;
+proc reg data=rp.analysis_pill2 plots=none outest=rc_reg_m_pill;
+by epi_id; model res_m = dc dc_2 dc_3 / noprint ;
+run;
+proc reg data=rp.analysis_pill2 plots=none outest=rc_reg_q_pill;
+by epi_id; model res_q = dc dc_2 dc_3 / noprint ;
+run;
+proc sql;
+create table rc_reg_pill (compress=yes) as
+select 	a.epi_id,
+		a.intercept as reg_im, a.dc as reg_lm, a.dc_2 as reg_2m, a.dc_3 as reg_3m,
+		b.intercept as reg_iq, b.dc as reg_lq, b.dc_2 as reg_2q, b.dc_3 as reg_3q
+from rc_reg_m_pill a left join rc_reg_q_pill b on a.epi_id=b.epi_id;
+quit;
+* Merge files for analysis;
+proc sql;
+create table rp.tjvars_po (compress=yes drop=eid) as
+select a.*, b.*
+from rp.pstats_po  				 	  a left join 
+	 rc_reg_pill (rename=(epi_id=eid)) b on a.epi_id=b.eid;
+quit;
+
+** Calculate MME RESIDUAL summary statistics;;
+* Prep file for calculations;;
+proc sql;							
+create table rpm as
+select epi_id, (3*reg_3m) as a, (2*reg_2m) as b, reg_lm as c,
+	   reg_3m as b3, reg_2m as b2, reg_lm as b1, reg_im as b0
+from rc_reg_pill;
+quit;
+* MME RESID: Polynomial statistic calculations;;
+data calc_rm; set rpm;				
+aucall	=((-12209/4)*b3)+((6119/3)*b2)+((-14.5)*b1)+(29*b0); 	/* area under the curve (all 29 days) */
+auc_30	=(30*b0)+(2250*b2); 									/* area under the curve (all 30 days) */
+auc1	=(-12656.25*b3)+(1125*b2)+(-112.5*b1)+(15*b0); 			/* area under the curve (0 to 15 days) */ 
+auc2	=(9406*b3)+(2744*b2)+(98*b1)+(14*b0); 					/* area under the curve (15 to 29 days) */ 
+auc3	=(-12500*b3)+((3250/3)*b2)-(100*b1)+(10*b0); 			/* area under the curve (0 to 10 days) */
+auc4	=((250/3)*b2)+(10*b0); 									/* area under the curve (10 to 20 days) */
+auc5	=(9447.75*b3)+((2869/3)*b2)+(85.5*b1)+(9*b0); 			/* area under the curve (20 to 29 days) */
+auc2_30	=(12656.25*b3)+(1125*b2)+(112.5*b1)+(15*b0); 			/* area under the curve (15 to 30 days) */ 
+auc5_30	=(12500*b3)+((3250/3)*b2)+(100*b1)+(10*b0); 			/* area under the curve (20 to 30 days) */
+
+sq=(b*b)-(4*a*c);
+if a ne 0 and sq ge 0 then p=((-b)+sqrt(sq))/(2*a); 			/* local polynomial critical point - plus - if outside range set to missing */
+	if p gt 14 then p = .; if p lt -15 then p = .;
+if a ne 0 and sq ge 0 then m=((-b)-sqrt(sq))/(2*a); 			/* local polynomial critical point - minus - if outside range set to missing */
+	if m gt 14 then m = .; if m lt -15 then m = .;
+phat_0=((-15)*(-15)*(-15)*b3)+((-15)*(-15)*b2)+((-15)*b1)+b0; 	/* predicted daily mme at day zero */
+phat_30=((14)*(14)*(14)*b3)+((14)*(14)*b2)+((14)*b1)+b0; 		/* predicted daily mme at day thirty */
+if p ne . then phat_plus=(p*p*p*b3)+(p*p*b2)+(p*b1)+b0; 		/* predicted daily mme at plus critical point */
+if m ne . then phat_minus=(m*m*m*b3)+(m*m*b2)+(m*b1)+b0; 		/* predicted daily mme at minus critical point */
+mn=min(of phat_0, phat_30, phat_plus, phat_minus); 				/* select minimum predicted mme */
+	if mn=phat_0 then day_min=-15; 
+	if mn=phat_30 then day_min=14;
+	if mn=phat_plus then day_min=p; 
+	if mn=phat_minus then day_min=m; 							/* determine on which day the minimum occurs */
+mx=max(of phat_0, phat_30, phat_plus, phat_minus); 				/* select maximum predicted mme*/
+	if mx=phat_0 then day_max=-15; 
+	if mx=phat_30 then day_max=14;
+	if mx=phat_plus then day_max=p; 
+	if mx=phat_minus then day_max=m;							/* determine on which day the maximum occurs */
+
+if b3 ne 0 then v10=((-b2)/(3*b3))+5;							/* day of critical point - if outside range set to missing */
+	if v10 gt 14 then v10 = .; if v10 lt -6 then v10 = .;
+v10_sq=30*b3; v10_lin=(-300*b3)+(20*b2); 
+v10_cons=(1000*b3)-(100*b2)+(10*b1);
+v10_0to10=((-6)*(-6)*v10_sq)+((-6)*v10_lin)+v10_cons;			/* change between days 0 and 10 */
+v10_20to30=((14)*(14)*v10_sq)+((14)*v10_lin)+v10_cons;			/* change between days 20 and 30 */
+if v10 ne . 
+	then v10_crit=((v10)*(v10)*v10_sq)+((v10)*v10_lin)+v10_cons;/* change over 10 days prior to critical point */
+vmx10=max(of v10_crit, v10_0to10, v10_20to30);					/* select maximum predicted 10-day change */
+	if vmx10=v10_crit then day_v10max=v10;
+	if vmx10=v10_0to10 then day_v10max=-6;
+	if vmx10=v10_20to30 then day_v10max=14;						/* determine on which day the maximum change occurs */
+
+v5=(75-(10*b2))/30;												/* day of critical point - if outside range set to missing */
+	if v5 gt 14 then v5 = .; if v5 lt -11 then v5 = .;
+v5_sq=15; v5_lin=(10*b2)-75; v5_cons=(-25*b2)+(5*b1)+125;
+v5_0to5=((-11)*(-11)*(v5_sq))+((-11)*v5_lin)+v5_cons;			/* change between days 0 and 5 */
+v5_25to30=((14)*(14)*(v5_sq))+((14)*v5_lin)+v5_cons;			/* change between days 25 and 30 */
+if v5 ne . 
+	then v5_crit=((v5)*(v5)*(v5_sq))+((v5)*v5_lin)+v5_cons;		/* change over 5 days prior to critical point */
+vmx5=max(of v5_crit, v5_0to5, v5_25to30);						/* select maximum predicted 5-day change*/
+	if vmx5=v5_crit then day_v5max=v5;
+	if vmx5=v5_0to5 then day_v5max=-11;
+	if vmx5=v5_25to30 then day_v5max=14;						/* determine on which day the maximum change occurs */
+run;
+* MME RESID: Categorize and construct additional variables;;
+proc sql; 							
+create table r_mmestats as	
+select 	epi_id, aucall as r_mme_auc, auc_30 as r_mme_aucold,
+		auc1 as r_mme_auc0to15, auc2 as r_mme_auc15to30, auc3 as r_mme_auc0to10, auc4 as r_mme_auc10to20, auc5 as r_mme_auc20to30,
+		auc2-auc1 as r_mme_diff_auc, auc4-auc3 as r_mme_diff_auc1, auc5-auc4 as r_mme_diff_auc2, 
+		day_min+15 as r_mme_minday, day_max+15 as r_mme_maxday,
+		case when day_max ge -15 and day_max lt -5 then 1
+			 when day_max ge -5 and day_max lt 5 then 2
+			 when day_max ge 5 and day_max le 14 then 3 else . end as r_mme_maxday_c,
+		case when day_min ge -15 and day_min lt -5 then 1
+			 when day_min ge -5 and day_min lt 5 then 2
+			 when day_min ge 5 and day_min le 14 then 3 else . end as r_mme_minday_c,
+		day_v5max+15 as r_mme_v5_maxday,
+		case when day_v5max ge -15 and day_v5max lt -5 then 1
+			 when day_v5max ge -5 and day_v5max lt 5 then 2
+			 when day_v5max ge 5 and day_v5max le 14 then 3 else . end as r_mme_v5_maxday_c,
+		day_v10max+15 as r_mme_v10_maxday,
+		case when day_v10max ge -15 and day_v10max lt -5 then 1
+			 when day_v10max ge -5 and day_v10max lt 5 then 2
+			 when day_v10max ge 5 and day_v10max le 14 then 3 else . end as r_mme_v10_maxday_c
+from calc_rm;
+quit;
+
+** Calculate QUANTITY summary statistics;;
+* Prep file for calculations;;
+proc sql;						
+create table rpq as
+select epi_id, (3*reg_3q) as a, (2*reg_2q) as b, reg_lq as c,
+	   reg_3q as b3, reg_2q as b2, reg_lq as b1, reg_iq as b0
+from rc_reg_pill;
+quit;
+* QUAN RESID: Polynomial statistic calculations;;
+data calc_rq; set rpq;				
+aucall	=((-12209/4)*b3)+((6119/3)*b2)+((-14.5)*b1)+(29*b0); 	/* area under the curve (all 29 days) */
+auc_30	=(30*b0)+(2250*b2); 									/* area under the curve (all 30 days) */
+auc1	=(-12656.25*b3)+(1125*b2)+(-112.5*b1)+(15*b0); 			/* area under the curve (0 to 15 days) */ 
+auc2	=(9406*b3)+(2744*b2)+(98*b1)+(14*b0); 					/* area under the curve (15 to 29 days) */ 
+auc3	=(-12500*b3)+((3250/3)*b2)-(100*b1)+(10*b0); 			/* area under the curve (0 to 10 days) */
+auc4	=((250/3)*b2)+(10*b0); 									/* area under the curve (10 to 20 days) */
+auc5	=(9447.75*b3)+((2869/3)*b2)+(85.5*b1)+(9*b0); 			/* area under the curve (20 to 29 days) */
+auc2_30	=(12656.25*b3)+(1125*b2)+(112.5*b1)+(15*b0); 			/* area under the curve (15 to 30 days) */ 
+auc5_30	=(12500*b3)+((3250/3)*b2)+(100*b1)+(10*b0); 			/* area under the curve (20 to 30 days) */
+
+sq=(b*b)-(4*a*c);
+if a ne 0 and sq ge 0 then p=((-b)+sqrt(sq))/(2*a); 			/* local polynomial critical point - plus - if outside range set to missing */
+	if p gt 14 then p = .; if p lt -15 then p = .;
+if a ne 0 and sq ge 0 then m=((-b)-sqrt(sq))/(2*a); 			/* local polynomial critical point - minus - if outside range set to missing */
+	if m gt 14 then m = .; if m lt -15 then m = .;
+phat_0=((-15)*(-15)*(-15)*b3)+((-15)*(-15)*b2)+((-15)*b1)+b0; 	/* predicted daily q at day zero */
+phat_30=((14)*(14)*(14)*b3)+((14)*(14)*b2)+((14)*b1)+b0; 		/* predicted daily q at day thirty */
+if p ne . then phat_plus=(p*p*p*b3)+(p*p*b2)+(p*b1)+b0; 		/* predicted daily q at plus critical point */
+if m ne . then phat_minus=(m*m*m*b3)+(m*m*b2)+(m*b1)+b0; 		/* predicted daily q at minus critical point */
+mn=min(of phat_0, phat_30, phat_plus, phat_minus); 				/* select minimum predicted mme */
+	if mn=phat_0 then day_min=-15; 
+	if mn=phat_30 then day_min=14;
+	if mn=phat_plus then day_min=p; 
+	if mn=phat_minus then day_min=m; 							/* determine on which day the minimum occurs */
+mx=max(of phat_0, phat_30, phat_plus, phat_minus); 				/* select maximum predicted q*/
+	if mx=phat_0 then day_max=-15; 
+	if mx=phat_30 then day_max=14;
+	if mx=phat_plus then day_max=p; 
+	if mx=phat_minus then day_max=m;							/* determine on which day the maximum occurs */
+
+if b3 ne 0 then v10=((-b2)/(3*b3))+5;							/* day of critical point - if outside range set to missing */
+	if v10 gt 14 then v10 = .; if v10 lt -6 then v10 = .;
+v10_sq=30*b3; v10_lin=(-300*b3)+(20*b2); 
+v10_cons=(1000*b3)-(100*b2)+(10*b1);
+v10_0to10=((-6)*(-6)*v10_sq)+((-6)*v10_lin)+v10_cons;			/* change between days 0 and 10 */
+v10_20to30=((14)*(14)*v10_sq)+((14)*v10_lin)+v10_cons;			/* change between days 20 and 30 */
+if v10 ne . 
+	then v10_crit=((v10)*(v10)*v10_sq)+((v10)*v10_lin)+v10_cons;/* change over 10 days prior to critical point */
+vmx10=max(of v10_crit, v10_0to10, v10_20to30);					/* select maximum predicted 10-day change */
+	if vmx10=v10_crit then day_v10max=v10;
+	if vmx10=v10_0to10 then day_v10max=-6;
+	if vmx10=v10_20to30 then day_v10max=14;						/* determine on which day the maximum change occurs */
+
+v5=(75-(10*b2))/30;												/* day of critical point - if outside range set to missing */
+	if v5 gt 14 then v5 = .; if v5 lt -11 then v5 = .;
+v5_sq=15; v5_lin=(10*b2)-75; v5_cons=(-25*b2)+(5*b1)+125;
+v5_0to5=((-11)*(-11)*(v5_sq))+((-11)*v5_lin)+v5_cons;			/* change between days 0 and 5 */
+v5_25to30=((14)*(14)*(v5_sq))+((14)*v5_lin)+v5_cons;			/* change between days 25 and 30 */
+if v5 ne . 
+	then v5_crit=((v5)*(v5)*(v5_sq))+((v5)*v5_lin)+v5_cons;		/* change over 5 days prior to critical point */
+vmx5=max(of v5_crit, v5_0to5, v5_25to30);						/* select maximum predicted 5-day change*/
+	if vmx5=v5_crit then day_v5max=v5;
+	if vmx5=v5_0to5 then day_v5max=-11;
+	if vmx5=v5_25to30 then day_v5max=14;						/* determine on which day the maximum change occurs */
+
+run;
+* QUAN RESID: Categorize and construct additional variables;;
+proc sql; 							
+create table r_quanstats as	
+select 	epi_id, aucall as r_q_auc, auc_30 as r_q_aucold,
+		auc1 as r_q_auc0to15, auc2 as r_q_auc15to30, auc3 as r_q_auc0to10, auc4 as r_q_auc10to20, auc5 as r_q_auc20to30,
+		auc2-auc1 as r_q_diff_auc, auc4-auc3 as r_q_diff_auc1, auc5-auc4 as r_q_diff_auc2, 
+/*		case when (calculated q_diff_auc2) gt (calculated q_diff_auc1) then 1 else 0 end as q_incdiff_auc,	*/
+		day_min+15 as r_q_minday, day_max+15 as r_q_maxday,
+		case when day_max ge -15 and day_max lt -5 then 1
+			 when day_max ge -5 and day_max lt 5 then 2
+			 when day_max ge 5 and day_max le 15 then 3 else . end as r_q_maxday_c,
+		case when day_min ge -15 and day_min lt -5 then 1
+			 when day_min ge -5 and day_min lt 5 then 2
+			 when day_min ge 5 and day_min le 15 then 3 else . end as r_q_minday_c,
+		day_v5max+15 as r_q_v5_maxday,
+		case when day_v5max ge -15 and day_v5max lt -5 then 1
+			 when day_v5max ge -5 and day_v5max lt 5 then 2
+			 when day_v5max ge 5 and day_v5max le 15 then 3 else . end as r_q_v5_maxday_c,
+		day_v10max+15 as r_q_v10_maxday,
+		case when day_v10max ge -15 and day_v10max lt -5 then 1
+			 when day_v10max ge -5 and day_v10max lt 5 then 2
+			 when day_v10max ge 5 and day_v10max le 15 then 3 else . end as r_q_v10_maxday_c
+from calc_rq;
+quit;
+
+** Merge MME and quantity residual files;
+proc sql;
+create table rp.rpstats_po (compress=yes drop=eid) as
+select a.*, b.*
+from r_mmestats 						   a inner join 
+	 r_quanstats (rename=(epi_id=eid)) b on a.epi_id=b.eid
+;
+quit;
+
+* Delete datasets no longer needed;
+proc datasets library=work noprint; 
+delete res_m_pill res_q_pill rc_reg_m_pill rc_reg_q_pill rc_reg_pill rpm calc_rm r_mmestats rpq calc_rq r_quanstats; 
+run; quit;
+
+
+
+***** 1.4 Merge Trajectory Files *****;
+;
+
+proc sql;
+create table rp.tjvars_po2 (compress=yes drop=eid eid2) as
+select a.epi_id, a.clust_num, a.firstday as day0, b.*, c.*
+from rp.p_eps 							 	a full join
+	 rp.tjvars_po (rename=(epi_id=eid)) 	b on a.epi_id=b.eid full join
+	 rp.rpstats_po (rename=(epi_id=eid2)) 	c on a.epi_id=c.eid2;
+quit;
+
+
+***********************************************************************************************;
+***********************************************************************************************;
+***********************************************************************************************;
+
+
+***********************************************************************************************
+**										SECTION 2									  		 **
+**								 Non-Trajectory Variables									 **
+***********************************************************************************************;
+
+***** 2.1 Generate Base Dataset *****;
+
+** Identify all opioid prescriptions between index day and day 30 for each PONI;;
+proc sql; 
+create table d30 (compress = yes) as
+select distinct a.clust_num, b.filled_at as day0 format mmddyy10., (b.filled_at+29) as day30 format mmddyy10., 
+	b.long_term, b.age, b.sexnum,   
+	a.filled_at, a.ndc, a.quantity, a.mme_day as mme, a.prescriber_id, a.dispensary_id, a.days_supply, 
+	a.tab, (a.filled_at + a.days_supply)-1 as last_day format mmddyy10.
+from poni.all_opioids a
+inner join poni.first_opi b on a.clust_num = b.clust_num
+where 2020 < year(b.filled_at) < 2024 and (b.filled_at <= a.filled_at <= (b.filled_at+29)) and a.opioid = 1;
+quit; 
+
+
+***** 2.2 Active Prescription Variables *****;
+/******DELCHER MODIFICATION HERE. NEED TO GET DRUG NAMES FROM NDC LINKAGE*******/
+** Add Index day opioid type variable;;
+
+data poni.first_opi;
+set poni.first_opi;
+NDC_CHAR=put(NDC,12.);
+run;
+
+/*I think this was used to get a new NDC file but very large and not needed really*/
+/*
+proc sql;
+create table poni.first_opi2 as 
+select * from poni.first_opi a
+left join poni.temp_c1 (keep=ndc drug_name) b on a.ndc = b.ndc;
+run;
+quit;
+
+/**I DON'T THINK DRUG=OTHER IS WORKING AS INTENDED**/
+
+/*PROC IMPORT OUT= raw.MME_OPIOID_UPDATED_VW2 
+            DATAFILE= "Y:\095IPOP_KASPER_Delcher-Raw\MME_OPIOID_UPDATED_VW2.txt" 
+            DBMS=DLM REPLACE;
+     DELIMITER='7C'x; 
+     GETNAMES=YES;
+     DATAROW=2; 
+RUN;*/
+
+proc sql;
+create table da1opi (compress = yes) as
+select distinct a.clust_num, a.filled_at as day0 format mmddyy10., year(a.filled_at) as year, b.ndc, b.drug_short,
+
+case
+    when a.ndc in (59011075004, 59011075104, 59011075204, 59011075804) then "BUPRENORPHINE"
+    when a.ndc in (54309036, 378963943, 60505081301) then "BUTORPHANOL"
+    when a.ndc in (54024425, 54024525, 93015001, 93015010, 93035001, 93035010, 406048301, 406048401, 406048410, 406048423, 406048462, 406048501, 406048505, 527131201, 527169801, 591264101, 591322001, 591354601, 603233832, 603233921, 603255321, 13107005801, 13107005901, 13107005999, 13107006001, 13107006005, 13107006099, 51991007301, 51991007401, 65162003310, 65162003311) then "CODEINE"
+    when a.ndc in (42195084010, 66992084010) then "DIHYDROCODONE"
+    when a.ndc in (378911998, 378912198, 378912298, 378912398, 378912498, 378912598, 378912698, 406900076, 406901276, 406902576, 406905076, 406907576, 406920230, 591319872, 591321272, 781724055, 781724155, 781724255, 781724455, 20482000110, 20482000630, 47781042647, 49884076178, 49884076378, 49884076478, 50458009005, 50458009105, 50458009205, 50458009305, 50458009405, 60505700600, 60505700602, 60505700702, 60505700802, 60505700902, 60505701002) then "FENTANYL"
+    when a.ndc in (121077204, 121077216, 406012301, 406012310, 406012323, 406012362, 406012401, 406012405, 406012410, 406012423, 406012462, 406012501, 406012505, 406012510, 406012562, 591217201, 591217205, 591260501, 591260505, 591261205, 603358621, 603388721, 603388728, 603388732, 603389021, 603389028, 603389032, 603389121, 603389128, 603389132, 603389721, 603389728, 13107001901, 13107001905, 13107002001, 13107002005, 13107002101, 13107002105, 13107002199, 27808003501, 27808003502, 27808003503, 27808003601, 27808003602, 27808003603, 27808003701, 27808003702, 27808003703, 27808011401, 42858020101, 42858020150, 42858020201, 42858020301, 42858020350, 50268040111, 50268040115, 50268040215, 53746010901, 53746010905, 53746011001, 53746011005, 53746011701, 53746014501, 57664012688, 57664017013, 57664017088, 57664017613, 57664017688, 59011027160, 59011027260, 59011027360, 59011027460, 64376064801, 64376064901, 65162011510, 65224031060, 65224033060, 68084036801, 68084089501, 68084089511, 406012305 ) then "HYDROCODONE"
+    when a.ndc in (54026425, 54026525, 54038663, 406324301, 406324401, 406324901, 406330801, 406331201, 527135301, 527135401, 574029301, 591373901, 13107010701, 13107010801, 13107010901, 23635040801, 42858030101, 42858030125, 42858030201, 42858030225, 42858030250, 42858030301, 42858030416, 68084042301) then "HYDROMORPHONE"
+    when a.ndc in (42358010210) then "LEVORPHANOL"
+    when a.ndc in (54354563, 54459525, 54459625, 555038102, 555039202, 42806005001, 42806005101) then "MEPERIDINE"
+    when a.ndc in (54355344, 54355563, 54355663, 54457025, 54457125, 54855424, 406052710, 406575501, 406575562, 406577101, 13107008801, 13107008901, 67877011601) then "METHADONE"
+    when a.ndc in (54023525, 54023625, 54023749, 54023763, 54023849, 54040441, 54040444, 54051741, 54051744, 54051750, 228309011, 228309111, 228309211, 228309311, 228311611, 228350106, 228350206, 228350306, 228350406, 228350506, 228427011, 228427111, 228431111, 228432311, 406800312, 406800315, 406800324, 406800330, 406831501, 406831562, 406833001, 406833062, 406838001, 406839001, 574015330, 832022500, 832022600, 832022700, 832022800, 832022900, 832023300, 27808008201, 27808008202, 42858080101, 42858080201, 42858080301, 42858080401, 42858080501, 52544003260, 52544006360, 52544016460, 60793043020, 60793043120, 60793043320, 60793043420, 60793043520, 60951065270, 60951065370, 60951065570, 60951065870, 63304045001, 63304045101, 63304045201, 63304075801, 68094075458, 68382090301, 68382090401) then "MORPHINE"
+    when a.ndc in (54039063, 93573101, 93573201, 93573301, 93573401, 115155801, 115156001, 115156201, 228287811, 228287911, 228298311, 406051201, 406051205, 406051223, 406051262, 406052201, 406052205, 406052301, 406052305, 406055201, 406055262, 406851501, 406853001, 591269301, 591355101, 603497821, 603498221, 603499021, 603499121, 603499128, 603499221, 603499228, 603499821, 781570301, 904643861, 10702000801, 10702000850, 10702000901, 10702000950, 10702001801, 10702001850, 10702002301, 10702005601, 10702005650, 10702005701, 10702005750, 13107004401, 13107004405, 13107004501, 13107004505, 13107004601, 13107004605, 13107005501, 13107005601, 23635058110, 23635058210, 24510011010, 24510011510, 24510012010, 24510013010, 24510014010, 42806000501, 42806000601, 42806000701, 42806000801, 42858000101, 42858000110, 42858000201, 42858000301, 42858000401, 42858000501, 42858010201, 42858010250, 42858010301, 42858010350, 42858010401, 42858010450, 43386092060, 47781019601, 47781019605, 47781022901, 47781022905, 47781023001, 47781023005, 47781023063, 47781026305, 47781026405, 47781026501, 47781026505, 53746020301, 53746020305, 53746020401, 53746020405, 57664015588, 57664016088, 57664018788, 57664022388, 57664022488, 57664037088, 57664037188, 59011041010, 59011041020, 59011041510, 59011042010, 59011042020, 59011043010, 59011044010, 59011044020, 59011046010, 59011048010, 60429051601, 60429051701, 60429051901, 60429052101, 60951060270, 60951060285, 60951070070, 60951071270, 62559015116, 63481062870, 63481062970, 64950035450, 65162004710, 65162004750, 65162004810, 65162004910, 65162004950, 65162005010, 65162005110, 65162005150, 65162020710, 65162020750, 68084004801, 68084035401, 68084035501, 68308002003, 68308010801, 68308011201, 68308014501, 68308084101, 68308084201, 68382079401, 68382079601, 68462020401, 68462034737) then "OXYCODONE"
+    when a.ndc in (54028325, 54028425, 115123101, 115123113, 115123201, 115123213, 115123301, 115123313, 115123401, 115123413, 115131501, 115131513, 115131601, 115131613, 115131701, 115131713, 228322711, 228322811, 228326211, 406100901, 406101001, 10702007001, 10702007101, 60951079470, 60951079570) then "OXYMORPHONE"
+    when a.ndc in (591039501, 43386068001) then "PENTAZOCINE"
+    when a.ndc in (50458082002, 50458082004, 50458083004, 50458084004) then "TAPENTADOL"
+    when a.ndc in (93005801, 93005805, 378415101, 378415105, 378415293, 378415393, 378415493, 378808801, 378808805, 904636561, 10370022111, 10370022211, 10370022311, 13811069130, 16714011106, 16714048101, 16714048102, 16714048103, 42571011901, 47335053183, 47335085983, 47335086083, 47335086183, 49884082111, 50458065960, 51079099120, 53746061701, 53746061705, 57664037708, 57664037713, 57664037718, 57664053713, 57664053718, 57664053788, 60505264405, 63739067110, 65162062710, 65162062711, 65162062750, 68084080811, 68180069706, 68180069806, 68180069906, 68382031901, 68382031910, 68382033401, 68382033405, 69543013610, 69543013611, 69543013650) then "TRAMADOL"
+    		when count(distinct b.drug) = 1 and
+                  ((year(filled_at) ge 2014 and upcase(b.drug) = "TRAMADOL") or upcase(b.drug) in ("HYDROCODONE" "CODEINE" "OXYCODONE" "HYDROMORPHONE" "MORPHINE")) then upcase(b.drug)
+             when year(filled_at) lt 2014 and upcase(b.drug) = "TRAMADOL" then "OTHER"
+             when count(distinct b.drug) ge 1 or upcase(b.drug) not in ("HYDROCODONE" "CODEINE" "TRAMADOL" "OXYCODONE", "HYDROMORPHONE", "MORPHINE") then "OTHER" 
+end as drug1
+from poni.first_opi a
+left join raw.MME_OPIOID_UPDATED_VW2 b on a.ndc = b.ndc
+where year(a.filled_at)
+group by a.clust_num, a.filled_at
+order by a.clust_num, day0;
+quit;
+
+
+/****correction test****/
+
+
+        
+        
+
+
+** Identify active prescriptions on Day 30
+--Rx Type:
+	- Opioids
+		- tab= pill form
+		- liquid= liquid form
+		- otherpatch= other form
+		- lasap= long acting
+	- Non-opioids
+		- benzo= prescribed benzo
+		- ocs= prescribed other controlled substance
+--Active Rx Timing:
+					Day 1						   Day 30
+		(a, b, c)	  {------------------------------>
+		(1, ., .)	  {------------------------------}
+		(1, ., .)					   {-------------}
+		(., 1, .)	  								 |
+		(., 1, 1)	  								 {----->
+		(., ., 1)							{-------------->	
+;;
+proc sql; 
+create table act30_1 as
+select distinct b.clust_num, a.day0, a.day30, 
+	b.filled_at, b.filled_at + b.days_supply-1 as last_day format mmddyy10., 
+	case when b.tab in (0 3) then 1 else 0 end as otherpatch,
+	case when b.tab = 2 then 1 else 0 end as liquid,
+	coalesce(b.benzo_ndc,0) as benzo, 
+	coalesce(b.ocs, 0) as ocs,
+	case when b.lasa = 1 and b.tab = 1 then 1 else 0 end as lasap, 
+	case when (b.filled_at + b.days_supply) = a.day30 then 1 end as a,
+	case when (b.filled_at = a.day30) then 1 end as b,
+	case when b.filled_at <= a.day30 <= (b.filled_at + b.days_supply-1) then 1 end as c
+from d30 a
+inner join poni.all_opioids b  on a.clust_num = b.clust_num
+where (((b.filled_at <= a.day30 <= (b.filled_at + b.days_supply-1)) or  /* a */ 
+	  ((b.filled_at + b.days_supply) = a.day30) or /* b */
+	  (b.filled_at = a.day30))) /* c */
+order by clust_num, filled_at;
+quit; 
+
+
+* Macro to generate tables/vars for prescriptions active on day 30;;
+%macro tt (var); 
+proc sql; 
+create table act_&var. as
+select distinct clust_num, day0,
+case when max(c) = 1 or (max(a) = 1 and max(b) = 1) then 1 end as act30_&var.
+from act30_1 
+where &var. = 1
+group by clust_num, day0
+having act30_&var. = 1
+order by clust_num, day0;
+quit; 
+%mend;
+%tt(benzo);
+%tt(lasap);
+%tt(ocs);
+%tt(liquid);
+%tt(otherpatch);
+
+/****DATA TYPE ERRORS HERE with orignial macro, so wrote out data sets below****/
+* Merge into usable file;;
+data act_day30;
+merge act_benzo act_lasap act_ocs act_liquid act_otherpatch;
+by clust_num day0;
+run;
+
+***** 2.3 Dose Summary Variables *****;
+
+** Quantity and MME variables: day0 vs day30 - pills only;;
+proc sql; 
+create table q_days30 as
+select distinct clust_num, day0, 
+	sum(case when filled_at = day0 then quantity end) as quan_tab0,
+	sum(case when filled_at <= day30 <= last_day then quantity end) as quan_tab30,
+	sum(case when filled_at = day0 then mme end) as mme_tab0,
+	sum(case when filled_at <= day30 <= last_day then mme end) as mme_tab30,  
+	sum(quantity) as quan_pill, sum(mme) as mme_pill,
+	count(*) as rx_pill,
+	count(distinct dispensary_id) as pharm_opipill, count(distinct prescriber_id) as er_opipill 
+from d30
+where tab = 1
+group by clust_num, day0
+order by clust_num, day0;
+quit;
+
+
+***********************************************************************************************;
+***********************************************************************************************;
+***********************************************************************************************;
+
+
+***********************************************************************************************
+**										SECTION 3									  		 **
+**						  Merge Datasets Into Single Analysis File							 **
+***********************************************************************************************;
+
+
+***** 3.1 Merge Individual Data Files *****;
+
+** Merge indicator and summary dose files;;
+data poni.ff; 
+merge  d30 (keep = clust_num day0 day30 long_term age sexnum tab filled_at) q_days30 act_day30;
+by clust_num day0;
+year = year(day0);
+ratio_pill30 = quan_pill/rx_pill;
+ratio_pill30_mme = mme_pill/rx_pill;
+lasa30 = n_lasa;
+
+pharm30_opipill = pharm_opipill;
+if pharm_opipill lt 2 then pharm30_opipill = 1;
+if pharm_opipill ge 2 then pharm30_opipill = 2;
+
+er30_opipill = er_opipill;
+if er_opipill lt 2 then er30_opipill = 1;
+if er_opipill ge 2 then er30_opipill = 2;
+
+ratio_erpill30 = rx_pill/er_opipill;
+if ratio_erpill30 lt 1 then ratio_erpill30 = 1;
+
+array zz {*}  _numeric_;
+do i = 1 to dim(zz);
+if zz{i} = . then zz{i} = 0;
+end;
+drop i;
+
+diffquan_tab30 = quan_tab30 - quan_tab0; 
+diffmme_tab30 = mme_tab30 - mme_tab0; 
+
+if filled_at = day0 then index=1; else index=0;
+if tab = 1 and index = 1 then pillponi=1; else pillponi=0;
+run;
+
+** Merge new variables with trajectory variables;;
+/**proc sql;
+create table rp.a1_d30_po as
+select a.*, propcase(b.drug1) as drug1
+from 	(
+		  select distinct a.*, b.*
+		  from (select * from poni.ff where pillponi=1) a full join 
+			rp.tjvars_po2 (rename=(clust_num=pid day0=d0)) b on a.clust_num=b.pid and a.day0=b.d0
+		  order by clust_num, day0;
+		) a 
+	left join da1opi b on a.clust_num=b.clust_num and a.day0=b.day0;
+quit;**/
+
+/**ChatGPT corrected***/
+proc sql;
+create table rp.a1_d30_po as
+select a.*, propcase(b.drug1) as drug1
+from (
+        select distinct sub_a.*, sub_b.*
+        from (select * from poni.ff where pillponi = 1) sub_a
+        full join rp.tjvars_po2 (rename = (clust_num = pid day0 = d0)) sub_b
+        on sub_a.clust_num = sub_b.pid and sub_a.day0 = sub_b.d0
+     ) a
+left join da1opi b 
+on a.clust_num = b.clust_num and a.day0 = b.day0;
+quit;
+
+
+***** 3.2 Add Variable Transformations *****;
+
+proc sql;
+create table rp.vars (compress=yes) as select *,
+	age*age as age_2, log(age) as log_age,
+	q_auc*q_auc as qa_2, q_diff_auc1*q_diff_auc1 as qd1_2, q_maxday*q_maxday as qmax_2, q_minday*q_minday as qmin_2,
+		r_q_maxday*r_q_maxday as rqmax_2, r_q_minday*r_q_minday as rqmin_2, r_q_v10_maxday*r_q_v10_maxday as rqv10max_2,
+		log(q_auc) as log_qa, log(q_maxday+0.0001) as log_qmax, log(q_minday+0.0001) as log_qmin, 
+		log(r_q_maxday+0.0001) as log_rqmax, log(r_q_minday+0.0001) as log_rqmin, log(r_q_v10_maxday+0.0001) as log_rqv10max,
+		diffquan_tab30*diffquan_tab30 as diffquan_tab30_2, ratio_pill30*ratio_pill30 as ratio_pill30_2, 
+		log(diffquan_tab30) as log_diffquan_tab30, log(ratio_pill30) as log_ratio_pill30,
+	mme_auc*mme_auc as mmea_2, mme_diff_auc1*mme_diff_auc1 as mmed1_2, mme_maxday*mme_maxday as mmemax_2, mme_minday*mme_minday as mmemin_2,
+		r_mme_maxday*r_mme_maxday as rmmemax_2, r_mme_minday*r_mme_minday as rmmemin_2, r_mme_v10_maxday*r_mme_v10_maxday as rmmev10max_2,
+		log(mme_auc) as log_mmea, log(mme_maxday+0.0001) as log_mmemax, log(mme_minday+0.0001) as log_mmemin, 
+		log(r_mme_maxday+0.0001) as log_rmmemax, log(r_mme_minday+0.0001) as log_rmmemin, log(r_mme_v10_maxday+0.0001) as log_rmmev10max,
+		diffmme_tab30*diffmme_tab30 as diffmme_tab30_2, ratio_pill30_mme*ratio_pill30_mme as ratio_pill30_mme_2,
+		log(diffmme_tab30) as log_diffmme_tab30, log(ratio_pill30_mme) as log_ratio_pill30_mme,
+	log(ratio_erpill30) as log_ratio_erpill30, ratio_erpill30*ratio_erpill30 as ratio_erpill30_2,
+	case when ratio_erpill30 = 1 then 1 when ratio_erpill30 > 1 and ratio_erpill30 <= 2 then 2 when ratio_erpill30 > 2 then 3 
+			   else . end as ratio_erpill30_c
+from rp.a1_d30_po where 2020 < year < 2024;
+quit;
+
+
+proc rank data=rp.vars out=rp.vars_rank groups=8;
+var q_auc diffquan_tab30; 
+ranks q_auc_c2 diffquan_tab30_c2; 
+run;
+
+***** 3.3 Final Files *****;
+
+
+** Full File;
+proc sql;
+create table rp.all_final (compress=yes) as
+select * from rp.vars_rank where epi_id ne .;
+quit;
+
+proc sql;
+select count (distinct(clust_num)) 
+from rp.all_final;
+run;
+quit;
+
+
+** Model Development File;;
+proc sql;
+create table rp.train_final (compress=yes) as
+select *, 1 as t_set
+from rp.vars_rank where 2020 < year < 2023 and epi_id ne .;
+quit;
+
+proc sql;
+select count (distinct(clust_num)) 
+from rp.train_final;
+run;
+quit;
+
+proc sql;
+select count (*) 
+from rp.train_final;
+run;
+quit;
+
+** Model Validation File;;
+proc sql;
+create table rp.test_final (compress=yes) as
+select *, 0 as t_set
+from rp.vars_rank where year=2023 and epi_id ne .;
+run;
+quit;
+
+proc sql;
+select count (distinct(clust_num)) 
+from rp.test_final;
+run;
+quit;
+
+data rp.re_combine;
+set rp.train_final rp.test_final;
+if upcase(drug1) in ("HYDROCODONE" "CODEINE" "TRAMADOL" "OXYCODONE") then drug2=drug1;
+else drug2="Other";
+run;
+
+PROC EXPORT DATA= RP.TEST_FINAL 
+            OUTFILE= "Y:\095IPOP_KASPER_Delcher-Team\test_final_v4.csv" 
+            DBMS=CSV REPLACE;
+     PUTNAMES=YES;
+RUN;
+
+PROC EXPORT DATA= RP.TRAIN_FINAL 
+            OUTFILE= "Y:\095IPOP_KASPER_Delcher-Team\train_final_v4.csv" 
+            DBMS=CSV REPLACE;
+     PUTNAMES=YES;
+RUN;
+
+
+
+
