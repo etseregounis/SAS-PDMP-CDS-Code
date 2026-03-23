@@ -198,74 +198,23 @@ proc sql;
 	        case when DAYS_SUPPLY <= 0 and QUANTITY >= 30 then 30
                when DAYS_SUPPLY <= 0 and 0 < QUANTITY < 30 then 10
                when DAYS_SUPPLY <= 0 and QUANTITY <= 0 then 0
-else DAYS_SUPPLY 
-end 
-as DAYS_SUPPLY length=3 format=3.,
-	LongShortActing,
-case 
-when LongShortActing = 'L' then 1 
-else 0 
-end 
-as lasa length=3 format=2.,
-PATIENT_ZIP format=6.,
-benzo_ndc length=3 format=2.,
-fenpat,
-tab,
-ocs,
-drug_name,
-opioid length=3 format=2.,
-DEA_SCHEDULE_NUM,
-bup,
-ndc_nine
-from raw.kasper_from_sql
-where 
-	cough ne 1 
-	and mat ne 1 
-	and CLUST_NUM ne .
-group by CLUST_NUM, FILLED_AT
-	)
-group by CLUST_NUM, FILLED_AT, opioid;
+							 else DAYS_SUPPLY end as DAYS_SUPPLY length=3 format=3.,
+					LongShortActing,
+					case when LongShortActing = 'L' then 1 else 0 end as lasa length=3 format=2.,
+					PATIENT_ZIP format=6., benzo_ndc length=3 format=2., fenpat, tab, ocs, drug_name, opioid length=3 format=2.,
+					DEA_SCHEDULE_NUM, bup, ndc_nine
+				from raw.kasper_from_sql
+				where cough ne 1 and mat ne 1 and CLUST_NUM ne .
+				group by CLUST_NUM, FILLED_AT
+			)
+	group by CLUST_NUM, FILLED_AT, opioid;
 quit;
 
 proc sql;
 	select count(distinct(clust_num))
-		from raw.temp1
-		where year(FILLED_AT) in (2021,2022,2023)
-;
-run;
-
+	from raw.temp1
+	where year(FILLED_AT) in (2021,2022,2023);
 quit;
-
-
-/*
-data raw.age_test;
-set raw.temp1;
-if age = . then age_grp=99;
-	else if age<=12 then age_grp=0;
-else age_grp=1;
-run;
-
-proc freq data=raw.age_test;
-tables age_grp;
-run;*/
-
-/**had ocs already so i don't think this is necessary**/
-
-/*proc sql;
-create table temp2  (compress = yes) as
-select distinct a.CLUST_NUM, a.FILLED_AT, a.NDC, a.PRESCRIBER_ID, a.DISPENSARY_ID, a.PRESCRIBER_POSTAL_CODE,
-a.QUANTITY, a.DAYS_SUPPLY, 1 as ocs, year(a.PATIENT_DOB) as birth_year, a.PATIENT_GENDER as sex
-from raw.(raw KASPER data file) a
- inner join ndc.ocs b on a.NDC = b.ndc
-where a.CLUST_NUM ne .;
-quit;*/
-
-/****use raw.temp1 instead of temp_c1***/
-data poni.temp_c1;
-	set raw.temp1 /*temp2*/;
-run;
-
-*/
 
 ***********************************************************************************************
 							STEP 2 
@@ -275,25 +224,18 @@ Limits data set to opioid prescriptions.
 -Counts number of pharmacies and prescribers per date filled
 -Calculates last day of prescription from date filled
 ***********************************************************************************************;
+
 proc sql;
 	create table poni.temp_c2 (compress = yes) as
-		select distinct CLUST_NUM, NDC, FILLED_AT, limit, FILLED_AT + (max(DAYS_SUPPLY)-1) as last_day format mmddyy10., nn, mdf
-			from (
+	select distinct CLUST_NUM, NDC, FILLED_AT, limit, FILLED_AT + (max(DAYS_SUPPLY)-1) as last_day format mmddyy10., nn, mdf
+	from (
 				select CLUST_NUM, NDC, FILLED_AT, DAYS_SUPPLY, limit, count(distinct FILLED_AT) as nn length 3 format 3., 
 					min(FILLED_AT) as mdf format mmddyy10.
 				from raw.temp1 (keep = CLUST_NUM NDC FILLED_AT DAYS_SUPPLY opioid limit)
-					where opioid = 1
-						group by CLUST_NUM
-							)
-						group by CLUST_NUM, FILLED_AT
-							order by CLUST_NUM, FILLED_AT;
-quit;
-
-proc sql;
-	select count(distinct(clust_num)) 
-		from poni.temp_c2;
-run;
-
+					where opioid = 1 group by CLUST_NUM
+			 )
+	group by CLUST_NUM, FILLED_AT
+	order by CLUST_NUM, FILLED_AT;
 quit;
 
 ***********************************************************************************************
@@ -303,6 +245,7 @@ between the run-out date of one and the date filled of the next.
 -Retains pharm and prescriber counts from first day
 -Calculates number of days in episode
 ***********************************************************************************************;
+
 data poni.temp_c3a (compress = yes);
 	set poni.temp_c2;
 	by CLUST_NUM FILLED_AT;
@@ -320,11 +263,9 @@ data poni.temp_c3a (compress = yes);
 
 	retain mld day1;
 
-	if mld lt last_day then
-		mld = last_day;
+	if mld lt last_day then mld = last_day;
 
-	if ld ge last_day then
-		last_day = ld;
+	if ld ge last_day then last_day = ld;
 	ldf = lag(mld);
 	days = FILLED_AT - ldf;
 
@@ -337,8 +278,7 @@ data poni.temp_c3a (compress = yes);
 	if days gt 1 then
 		day1 = FILLED_AT;
 
-	if (((nn = 1 or mdf = FILLED_AT) and year ge 2019) or days ge 730) then
-		mdf2 = day1;
+	if (((nn = 1 or mdf = FILLED_AT) and year ge 2019) or days ge 730) then mdf2 = day1;
 	retain mdf2;
 	ct+1;
 
@@ -360,9 +300,9 @@ proc sql;
 	create table poni.temp_c3b (compress = yes) as
 		select distinct CLUST_NUM, limit, day1 as FILLED_AT format mmddyy10., mdf2 as mdf format mmddyy10., max(last_day) as last_day format mmddyy10.,
 			nn length 3, ct
-		from poni.temp_c3a
-			group by CLUST_NUM, day1
-				order by CLUST_NUM, mdf, FILLED_AT;
+	from poni.temp_c3a
+	group by CLUST_NUM, day1
+	order by CLUST_NUM, mdf, FILLED_AT;
 quit;
 
 data poni.temp_c3c (compress = yes);
@@ -383,17 +323,14 @@ data poni.temp_c3c (compress = yes);
 
 	retain day1;
 
-	if gap ge 60 then
-		day1 = FILLED_AT;
+	if gap ge 60 then day1 = FILLED_AT;
 	days = (last_day - day1) + 1;
 	year = year(FILLED_AT);
 	format day1 ld mmddyy10.;
 
-	if  (((nn = 1 or mdf = FILLED_AT) and year ge 2019) or gap ge 730) then
-		lim = 1;
+	if  (((nn = 1 or mdf = FILLED_AT) and year ge 2019) or gap ge 730) then lim = 1;
 
-	if first.FILLED_AT and FILLED_AT = day1 then
-		limit = lim;
+	if first.FILLED_AT and FILLED_AT = day1 then limit = lim;
 	retain limit;
 run;
 
@@ -407,179 +344,63 @@ Generate variables::
 ***********************************************************************************************;
 
 *** Outcome variable;;
+
 proc sql;
 	create table poni.temp_c4 (compress = yes) as
-		select distinct CLUST_NUM,  
-			mdf as naiveday, day1, 
+		select distinct CLUST_NUM, mdf as naiveday, day1, 
 			max(last_day) as last_day format mmddyy10., 
 			max(days) as days length 3 format 4., 
 			max(ct) as nn_scripts length 3 format 4.,
 			limit,
-		case 
-			when day1 = mdf and max(days) gt 90 and max(ct) ge 3 then 1 
-			else 0 
-		end 
-	as long_term length 3 format 2.
-		from poni.temp_c3c 
-			where limit = 1
-				group by CLUST_NUM, day1;
-quit;
-
-data test;
-set poni.temp_c4;
-if clust_num in (1508, 4027);
-run;
-
-proc sql;
-	create table poni.temp_c5_int (compress = yes) as
-		select distinct *, sum(mme_eq) as mme_day
-			from 
-				(
-			select distinct a.year, a.CLUST_NUM, a.FILLED_AT, a.NDC, a.QUANTITY, a.DAYS_SUPPLY, a.lasa, a.mme_eq,
-				a.PATIENT_ZIP,
-				a.opioid, a.DEA_SCHEDULE_NUM, a.tab, 
-				year-a.birth_year as age,
-				a.birth_year,
-				a.sex,
-				a.limit,
-				/**coalesce(b.birth_year, a.birth_year) as birth_year, **/
-				/**year - coalesce(b.birth_year, a.birth_year) as age,**/
-				/**coalesce(b.sex, a.sex) as sex, **/
-				a.PRESCRIBER_ID, a.PRESCRIBER_POSTAL_CODE, a.DISPENSARY_ID, a.DISPENSARY_POSTAL_CODE, 
-				c.last_day, c.days, c.long_term
-			from /*poni.temp_c1 */raw.temp1				a
-				inner join poni.temp_c4 		c on a.CLUST_NUM = c.CLUST_NUM and a.FILLED_AT = c.naiveday 
-					/**left join poni.birth_sex		b on c.CLUST_NUM = b.CLUST_NUM		/* fix sex var missing issues */
-				where a.limit = 1 and a.opioid = 1
-					
-				) 
-					group by CLUST_NUM, FILLED_AT
-						 ; /*having 0 < mme_day < 500*/
+			case when day1 = mdf and max(days) gt 90 and max(ct) ge 3 then 1 else 0 end as long_term length 3 format 2.
+	from poni.temp_c3c 
+	where limit = 1
+	group by CLUST_NUM, day1;
 quit;
 
 
-
-*** Limit data to patients with <500 MME per day, and older than 12, fix gender variable issues;;
+*** Limit data to patients with <500 MME per day, and older than 12;;
 proc sql;
 	create table poni.temp_c5 (compress = yes) as
 		select distinct *, sum(mme_eq) as mme_day
-			from 
-				(
-			select distinct a.year, a.CLUST_NUM, a.FILLED_AT, a.NDC, a.QUANTITY, a.DAYS_SUPPLY, a.lasa, a.mme_eq,
-				a.PATIENT_ZIP,
-				a.opioid, a.DEA_SCHEDULE_NUM, a.tab, 
-				year-a.birth_year as age,
-				a.birth_year,
-				a.sex,
-				a.limit,
-				/**coalesce(b.birth_year, a.birth_year) as birth_year, **/
-				/**year - coalesce(b.birth_year, a.birth_year) as age,**/
-				/**coalesce(b.sex, a.sex) as sex, **/
-				a.PRESCRIBER_ID, a.PRESCRIBER_POSTAL_CODE, a.DISPENSARY_ID, a.DISPENSARY_POSTAL_CODE, 
-				c.last_day, c.days, c.long_term
-			from /*poni.temp_c1 */raw.temp1				a
-				inner join poni.temp_c4 		c on a.CLUST_NUM = c.CLUST_NUM and a.FILLED_AT = c.naiveday 
-					/**left join poni.birth_sex		b on c.CLUST_NUM = b.CLUST_NUM		/* fix sex var missing issues */
-				where a.limit = 1 and a.opioid = 1
+	from (
+					select distinct a.year, a.CLUST_NUM, a.FILLED_AT, a.NDC, a.QUANTITY, a.DAYS_SUPPLY, a.lasa, a.mme_eq,
+						a.PATIENT_ZIP, a.opioid, a.DEA_SCHEDULE_NUM, a.tab, year-a.birth_year as age, a.birth_year, a.sex,
+						a.limit, a.PRESCRIBER_ID, a.PRESCRIBER_POSTAL_CODE, a.DISPENSARY_ID, a.DISPENSARY_POSTAL_CODE, 
+						b.last_day, b.days, b.long_term
+					from raw.temp1 a
+						inner join poni.temp_c4 b on a.CLUST_NUM = b.CLUST_NUM and a.FILLED_AT = b.naiveday 
+					where a.limit = 1 and a.opioid = 1
 					having age ge 12 
 				) 
-					group by CLUST_NUM, FILLED_AT
-						having 0 < mme_day < 500 ; /*having 0 < mme_day < 500*/
+		group by CLUST_NUM, FILLED_AT
+		having 0 < mme_day < 500 ;
 quit;
 
-proc sql;
-	select count(distinct(clust_num)) 
-		from poni.temp_c5;
-run;
 
-/*check on missing ndc 
-proc sql;
-create table poni.mme_missing as 
-select distinct(NDC), count (distinct(NDC)) as count_NDC
-from poni.temp_c5
-group by NDC;
-run;
-quit;
-
-proc sql;
-create table raw.miss_benzo_opi as
-select *
-from raw.medispan
-where NDC_UPC_HRI in (select put(ndc, z11.) from poni.mme_missing);
-quit;
-
-proc tabulate data=raw.miss_benzo_opi;
-class drug_name NDC_UPC_HRI item_stat_descr;
-tables drug_name*NDC_UPC_HRI, item_stat_descr n;
-run;
-
-proc sort data=raw.benzo_opi;
-by product_name NDC ;
-run;
-
-***/
-data poni.age_test;
-	set poni.temp_c5;
-
-	if age<=12;
-run;
-
-*/
 *** Active Day 0 rx variables;;
 proc sql;
 	create table poni.active0 as
 		select distinct a.CLUST_NUM, a.FILLED_AT,
-			max
-		(case 
-			when b.benzo_ndc = 1 	then 1 
-			else 0 
-		end)
-	as act0_benzo,
-		max
-	(case 
-		when b.tab = 0			then 1 
-		else 0 
-	end)
-as act0_other,
-	max
-(case 
-	when b.tab = 2 		then 1 
-	else 0 
-end)
-as act0_liquid,
-max
-(case 
-when b.tab = 3 		then 1 
-else 0 
-end)
-as act0_patch,
-max
-(case 
-when b.ocs = 1 		then 1 
-else 0 
-end)
-as act0_ocs,
-max
-(case 
-when b.tab = 1 and b.lasa = 1  then 1 
-else 0 
-end)
-as act0_lasap
-from /*poni.temp_c1*/
-	raw.temp1 b 
-	inner join poni.temp_c5 a on a.CLUST_NUM = b.CLUST_NUM 
-		where (b.FILLED_AT <= a.FILLED_AT <= (b.FILLED_AT + b.DAYS_SUPPLY-1))
-			group by a.CLUST_NUM, a.FILLED_AT;
+			max(case when b.benzo_ndc = 1 then 1 else 0 end) as act0_benzo,
+			max(case when b.tab = 0	then 1 else 0 end) as act0_other,
+			max(case when b.tab = 2 then 1 else 0 end) as act0_liquid,
+			max(case when b.tab = 3 then 1 else 0 end) as act0_patch,
+			max(case when b.ocs = 1 then 1 else 0 end) as act0_ocs,
+			max(case when b.tab = 1 and b.lasa = 1 then 1 else 0 end) as act0_lasap
+	from raw.temp1 b 
+		inner join poni.temp_c5 a on a.CLUST_NUM = b.CLUST_NUM 
+	where (b.FILLED_AT <= a.FILLED_AT <= (b.FILLED_AT + b.DAYS_SUPPLY-1))
+	group by a.CLUST_NUM, a.FILLED_AT;
 quit;
 
 *** Benzo, Non-opioid controlled substance variables;;
 proc sql;
 	create table poni.benz_ocs as
 		select distinct a.CLUST_NUM, a.FILLED_AT, max(a.benzo_ndc) as benzo, max(a.ocs) as ocs, a.PRESCRIBER_ID, a.DISPENSARY_ID
-			from /*poni.temp_c1*/
-	raw.temp1 a, poni.temp_c5 b
+	from raw.temp1 a, poni.temp_c5 b 
 	where (a.benzo_ndc = 1 or a.ocs = 1) and a.CLUST_NUM = b.CLUST_NUM
-		group by a.CLUST_NUM, a.FILLED_AT;
+	group by a.CLUST_NUM, a.FILLED_AT;
 quit;
 
 ***********************************************************************************************
@@ -588,69 +409,33 @@ Generate two files:
 - PONI only cohort (patients with only PONI status during study years)
 - All Opioid Rx file (Patients with any opioid Rx during study years)
 ***********************************************************************************************;
+
 proc sql;
 	create table poni.first_opi (compress = yes ) as
 		select distinct a.CLUST_NUM, a.FILLED_AT, a.last_day, a.days, coalesce(a.long_term, 0) as long_term, 
-			a.NDC, a.DAYS_SUPPLY, a.QUANTITY, a.mme_eq, a.mme_day,
-			a.birth_year, a.sex, a.age, a.limit, 
-		case 
-			when a.sex = "Unknown" then 0
-			when a.sex = "Female" then 1
-			when a.sex = "Male" then 2 
-		end 
-	as sexnum, a.tab, 
-		case 
-			when a.lasa = 1 and a.tab = 1 then 1 
-		end 
-	as lasap,
-		a.PATIENT_ZIP, a.PRESCRIBER_ID, a.DISPENSARY_ID, 
-		b.act0_benzo,
-		b.act0_liquid,
-		b.act0_patch,
-		b.act0_other,
-		max(b.act0_other,b.act0_patch) as act0_otherpatch,
-		b.act0_lasap,
-		b.act0_ocs, 
-		c.benzo, c.ocs
-	from poni.temp_c5			a 
+			a.NDC, a.DAYS_SUPPLY, a.QUANTITY, a.mme_eq, a.mme_day, a.birth_year, a.sex, a.age, a.limit, a.tab
+			case when a.sex = "Unknown" then 0 when a.sex = "Female" then 1 when a.sex = "Male" then 2 end as sexnum, 
+			case when a.lasa = 1 and a.tab = 1 then 1 end as lasap,
+			a.PATIENT_ZIP, a.PRESCRIBER_ID, a.DISPENSARY_ID, 
+			b.act0_benzo, b.act0_liquid, b.act0_patch, b.act0_other, max(b.act0_other,b.act0_patch) as act0_otherpatch, b.act0_lasap,
+			b.act0_ocs, 
+			c.benzo, c.ocs
+	from poni.temp_c5	a 
 		left join poni.active0 		b on a.CLUST_NUM = b.CLUST_NUM and a.FILLED_AT = b.FILLED_AT
 		left join poni.benz_ocs  	c on a.CLUST_NUM = c.CLUST_NUM and a.FILLED_AT = c.FILLED_AT
-			group by a.CLUST_NUM, a.FILLED_AT
-				order by a.CLUST_NUM, a.FILLED_AT;
+	group by a.CLUST_NUM, a.FILLED_AT
+	order by a.CLUST_NUM, a.FILLED_AT;
 quit;
 
-proc sql;
-	select count(distinct(clust_num)) 
-		from poni.first_opi;
-run;
-
-/*birth_sex file?*/
 proc sql;
 	create table poni.all_opioids (compress = yes) as
-		select distinct a.year, a.CLUST_NUM, a.FILLED_AT, a.NDC, 
-			a.QUANTITY, a.PRESCRIBER_ID, a.PRESCRIBER_POSTAL_CODE, a.DISPENSARY_ID, a.DISPENSARY_POSTAL_CODE, a.DAYS_SUPPLY,
-			a.lasa, a.birth_year as birth_year, a.sex as sex,
-			a.year - a.birth_year as age, 
-			a.PATIENT_ZIP, a.opioid, max(a.benzo_ndc) as benzo, a.benzo_ndc,
-			a.fenpat, a.DEA_SCHEDULE_NUM, a.tab, a.mme_eq, sum(a.mme_eq) as mme_day,
-		case 
-			when a.tab = 1 and a.lasa = 1 then 1 
-			else 0 
-		end 
-	as lasap, a.ocs
-		from /*poni.temp_c1*/
-	raw.temp1	a
-	/*left join poni.birth_sex	b on a.CLUST_NUM = b.CLUST_NUM*/
-	where a.limit = 1 or a.ocs = 1
-		group by a.CLUST_NUM, a.FILLED_AT
-			having age ge 12
-				order by a.CLUST_NUM, a.FILLED_AT;
-quit;
-
-proc sql;
-	select count(distinct(clust_num))
-		from poni.all_opioids
-			where opioid=1;
-run;
-
+		select distinct year, CLUST_NUM, FILLED_AT, NDC, QUANTITY, PRESCRIBER_ID, PRESCRIBER_POSTAL_CODE, DISPENSARY_ID, 
+			a.DISPENSARY_POSTAL_CODE, DAYS_SUPPLY, lasa, birth_year as birth_year, sex as sex, year - birth_year as age, PATIENT_ZIP, 
+			opioid, max(benzo_ndc) as benzo, benzo_ndc, fenpat, DEA_SCHEDULE_NUM, tab, mme_eq, sum(mme_eq) as mme_day,
+			case when tab = 1 and lasa = 1 then 1 else 0 end as lasap, ocs
+	from raw.temp1
+	where limit = 1 or ocs = 1
+	group by CLUST_NUM, FILLED_AT
+	having age ge 12
+	order by CLUST_NUM, FILLED_AT;
 quit;
