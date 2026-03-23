@@ -1,0 +1,172 @@
+***********************************************************************************************
+***********************************************************************************************
+**						Code to Score California Risk Prediction Model  					 **
+**							Using KY/KASPER Prescription Records							 **
+**											 **											 	 **
+**				     Developed for CURES Data, Adapted for KASPER Data						 **
+**							          6-2020 (2/3/2025)										 **
+***********************************************************************************************
+***********************************************************************************************;
+
+libname rp "ADD DIRECTORY";
+
+/***** Output original model predictions;;*/
+
+/*proc logistic data = rp.train1617 outmodel=rp.ca_model_preds;*/
+/*class 	sexnum (ref = '1') pharm30_opipill (ref = '1') er30_opipill (ref = '1') act30_benzo (ref = '0') act30_lasap (ref = '0')	*/
+/*		act30_otherpatch (ref = '0') act30_liquid (ref = '0') act30_ocs (ref = '0') drug1 (ref = 'Hydrocodone') / param = ref;*/
+/*model long_term (event = '1') = sexnum pharm30_opipill er30_opipill drug1*/
+/*									act30_benzo act30_lasap act30_otherpatch act30_liquid act30_ocs*/
+/*								age|ratio_pill30|ratio_erpill30|q_auc_c2|diffquan_tab30_c2|q_diff_auc1|q_maxday@2 */
+/*								age_2 ratio_pill30_2 ratio_erpill30_2 qd1_2 qmax_2 / stb clparm=wald; */
+/*output out=test p=ppred;*/
+/*run;*/
+
+**** Score KASPER data using California Model;;
+ods pdf file='ADD';
+data test_final_small ;
+set rp.test_final (OBS=10000);
+run;
+
+/*using updated drug2 as "drug1"*/
+data rp.test_final_drug2 (drop=drug1);
+set rp.test_final ;
+if upcase(drug1) in ("HYDROCODONE" "CODEINE" "TRAMADOL" "OXYCODONE") then drug2=drug1;
+else drug2="Other";
+run;
+
+data rp.test_final_drug2 (rename=(drug2=drug1));
+set rp.test_final_drug2;
+run;
+
+proc logistic inmodel=rp.ca_model_preds;
+score data=rp.test_final_drug2  out=rp.scored_KY(rename=(P_1=prob))  fitstat;
+run;
+
+/*take rp.scored_ky to 4a model update*/
+/*written out version of logistic regression model***/
+/*proc logistic data = rp.test_final outmodel=rp.ky_model_preds;
+class 	sexnum (ref = '1') pharm30_opipill (ref = '1') er30_opipill (ref = '1') act30_benzo (ref = '0') act30_lasap (ref = '0')	
+	act30_otherpatch (ref = '0') act30_liquid (ref = '0') act30_ocs (ref = '0') drug1 (ref = 'Hydrocodone') / param = ref;
+model long_term (event = '1') = sexnum pharm30_opipill er30_opipill drug1
+									act30_benzo act30_lasap act30_otherpatch act30_liquid act30_ocs
+						age|ratio_pill30|ratio_erpill30|q_auc_c2|diffquan_tab30_c2|q_diff_auc1|q_maxday@2 
+							age_2 ratio_pill30_2 ratio_erpill30_2 qd1_2 qmax_2 / stb clparm=wald;
+output out=test p=ppred;
+run;*/
+
+data scored_bin;
+   set rp.scored_KY;
+   predicted = (prob >= 0.5);
+run;
+
+proc freq data=scored_bin;
+   tables predicted*long_term / out=confmat nopercent norow nocol;
+run;
+
+data metrics;
+   set confmat;
+   if predicted=1 and long_term=1 then TP = count;
+   else if predicted=1 and long_term=0 then FP = count;
+   else if predicted=0 and long_term=0 then TN = count;
+   else if predicted=0 and long_term=1 then FN = count;
+run;
+
+/* Step 2: Collapse to one row and compute metrics */
+proc means data=metrics noprint;
+   var TP FP TN FN;
+   output out=totals sum=TP FP TN FN;
+run;
+
+/* Step 3: Calculate performance metrics */
+data final_metrics;
+   set totals;
+
+   total = TP + FP + TN + FN;
+   P = TP + FN;
+   N = TN + FP;
+
+   Accuracy    = (TP + TN) / total;
+   Sensitivity = TP / (TP + FN);
+   Specificity = TN / (TN + FP);
+   PPV         = TP / (TP + FP);
+   NPV         = TN / (TN + FN);
+   Youden      = Sensitivity + Specificity - 1;
+   NNP         = 1 / PPV;
+
+   format Accuracy Sensitivity Specificity PPV NPV Youden NNP 8.3;
+run;
+
+proc print data=final_metrics noobs; run;
+
+proc logistic data=rp.scored_KY;
+   model long_term(event='1') = prob;
+   roc 'Model' prob;
+   roccontrast ;
+run;
+
+*** Calibration;;
+* Generate deciles of risk and calculate mean long-term within each decile;
+proc rank data=rp.scored_KY out=dv groups=10; var prob; ranks decile; run;
+proc means data=dv noprint; class decile; types decile; var long_term prob; output out=cal mean=opm ppm lclm=opl uclm=opu; run;
+* Plot calibration curve - deciles of risk with mean predicted v. observed probabilities of long-term use;
+proc sgplot data=cal aspect=1 noautolegend noborder nowall; title "Validation Calibration Plot";
+lineparm x=0 y=0 slope=1 / lineattrs=(color=lightgrey pattern=solid thickness=3);
+loess x=ppm y=opm / interpolation=cubic clm;
+scatter x=ppm y=opm / markerattrs=(symbol=circle size=6 color=black) yerrorlower=opl yerrorupper=opu errorbarattrs=(color=grey thickness=0.2);
+yaxis label="Observed Probability of Outcome" offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+xaxis label="Predicted Probability of Outcome" offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+run;;
+	proc sgplot data=cal aspect=1 noautolegend noborder nowall; title "Validation Calibration Plot";
+	lineparm x=0 y=0 slope=1 / lineattrs=(color=lightgrey pattern=solid thickness=3);
+	loess x=ppm y=opm / interpolation=cubic clm;
+	/*scatter x=ppm y=opm / markerattrs=(symbol=circle size=6 color=black) yerrorlower=opl yerrorupper=opu errorbarattrs=(color=grey thickness=0.2);*/
+	yaxis label="Observed Probability of Outcome" values=(0 to .1 by 0.02) offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+	xaxis label="Predicted Probability of Outcome" values=(0 to .1 by 0.02) offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+	run;;
+	proc sgplot data=cal aspect=1 noautolegend noborder nowall; title "Validation Calibration Plot";
+	lineparm x=0 y=0 slope=1 / lineattrs=(color=lightgrey pattern=solid thickness=3);
+	loess x=ppm y=opm / interpolation=cubic clm;
+/*	scatter x=ppm y=opm / markerattrs=(symbol=circle size=6 color=black) yerrorlower=opl yerrorupper=opu errorbarattrs=(color=grey thickness=0.2);*/
+	yaxis label="Observed Probability of Outcome" values=(0 to .04 by 0.008) offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+	xaxis label="Predicted Probability of Outcome" values=(0 to .04 by 0.008) offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+	run;;
+ods pdf close;
+
+*** Update Intercept and Slope;;
+* Determine validation calibration slope and intercept;;
+data scored; set rp.scored_ky; lo=log(prob/(1-prob)); run;
+proc logistic data=scored;
+model long_term (event = '1') = lo / clparm=wald;
+ods output ParameterEstimates=estis2;
+run;
+* Store intercept and calculate updated intercept and slope;;
+ data _null_; set estis2;
+if variable="Intercept" then call symput("iis2", estimate);
+run; %put &=iis2;
+data scored; set scored; lo_cal2=lo+(&iis2); pp_cal2=1/(1+exp(-lo_cal2)); run;
+* Determine adjusted validation calibration intercept;;
+proc logistic data=scored;
+model long_term (event = '1') = lo_cal2 / clparm=wald;
+run;
+
+*** Calibration of adjusted predictions;;
+* Generate deciles of risk and calculate mean long-term within each decile;
+proc rank data=scored out=dv2 groups=10; var pp_cal2; ranks decile; run;
+proc means data=dv2 noprint; class decile; types decile; var long_term pp_cal2; output out=cal2 mean=opm ppm lclm=opl uclm=opu; run;
+* Plot calibration curve - deciles of risk with mean predicted v. observed probabilities of long-term use;
+proc sgplot data=cal2 aspect=1 noautolegend noborder nowall; title "Validation Calibration Plot";
+lineparm x=0 y=0 slope=1 / lineattrs=(color=lightgrey pattern=solid thickness=3);
+scatter x=ppm y=opm / markerattrs=(symbol=circle size=6 color=black) yerrorlower=opl yerrorupper=opu errorbarattrs=(color=grey thickness=0.2);
+yaxis label="Observed Probability of Outcome" values=(0 to .35 by 0.05) offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+xaxis label="Predicted Probability of Outcome" values=(0 to .35 by 0.05) offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+run;;
+	proc sgplot data=cal2 aspect=1 noautolegend noborder nowall; title "Validation Calibration Plot";
+	lineparm x=0 y=0 slope=1 / lineattrs=(color=lightgrey pattern=solid thickness=3);
+	scatter x=ppm y=opm / markerattrs=(symbol=circle size=6 color=black) yerrorlower=opl yerrorupper=opu errorbarattrs=(color=grey thickness=0.2);
+	yaxis label="Observed Probability of Outcome" values=(0 to .1 by 0.02) offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+	xaxis label="Predicted Probability of Outcome" values=(0 to .1 by 0.02) offsetmax=0 offsetmin=0 labelattrs=(size=9) valueattrs=(size=9);
+	run;;
+
+
+
