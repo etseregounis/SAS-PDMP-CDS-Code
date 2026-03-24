@@ -1,8 +1,8 @@
 ***********************************************************************************************
 ***********************************************************************************************
-**		    Code to Identify Naive Opioid Users (PONIs) and all Relevant Prescriptions	    	 **
-**				             Developed for CURES Data, Adapted for KASPER Data						         **
-**							        	                    9/2024											                   **
+**		   Code to Identify Naive Opioid Users (PONIs) and all Relevant Prescriptions	     **
+**						Developed for CURES Data, Adapted for KASPER Data			         **
+**											9/2024											 **
 ***********************************************************************************************
 ***********************************************************************************************;
 options compress = yes;
@@ -18,20 +18,20 @@ CODE NOTES:
 **PONI Date = Date of script meeting PONI criteria
 
 CURES to KASPER variable relationship::
-KASPER Varname				     	CURES Varname						    Variable Definition
-CLUST_NUM						        patient_id							    Patient encrypted identifier
-PATIENT_STATE					      patient_state						    State of residence listed for patient
-PATIENT_ZIP						      patient_zip							    Zip code listed for patient
-PATIENT_DOB						      patient_birth_year					Patient birth year
-PATIENT_GENDER					    patient_gender						  Patient sex
-PRESCRIBER_ID					      prescriber_id						    Prescriber encrypted identifier
-PRESCRIBER_POSTAL_CODE			prescriber_zip						  Zip code listed for prescriber
-FILLED_AT						        date_filled							    Date prescription was filled
-NDC								          ndcnum								      National drug code corresponding to filled medication
-DISPENSARY_ID					      pharmacy_id							    Pharmacy encrypted identifier
-DISPENSARY_POSTAL_CODE			pharmacy_zip						    Zip code listed for pharmacy
-DAYS_SUPPLY						      days_supply							    Days supply of medication dispensed
-QUANTITY						        quantity							      Quantity of medication in prescription
+KASPER Varname						CURES Varname						    Variable Definition
+CLUST_NUM						    patient_id							    Patient encrypted identifier
+PATIENT_STATE					    patient_state						    State of residence listed for patient
+PATIENT_ZIP						    patient_zip							    Zip code listed for patient
+PATIENT_DOB						    patient_birth_year						Patient birth year
+PATIENT_GENDER					    patient_gender						  	Patient sex
+PRESCRIBER_ID					    prescriber_id						    Prescriber encrypted identifier
+PRESCRIBER_POSTAL_CODE				prescriber_zip						  	Zip code listed for prescriber
+FILLED_AT						    date_filled							    Date prescription was filled
+NDC								    ndcnum								    National drug code corresponding to filled medication
+DISPENSARY_ID					    pharmacy_id							    Pharmacy encrypted identifier
+DISPENSARY_POSTAL_CODE				pharmacy_zip						    Zip code listed for pharmacy
+DAYS_SUPPLY						    days_supply							    Days supply of medication dispensed
+QUANTITY						    quantity							    Quantity of medication in prescription
 
 ***********************************************************************************************
 ***********************************************************************************************
